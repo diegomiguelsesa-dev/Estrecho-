@@ -1,0 +1,217 @@
+import requests
+import logging
+import time
+from datetime import datetime
+
+# ─── CONFIGURACIÓN ──────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = "8630080392:AAFusMZ2TzJ16EydYrtmSodDJ1yodpagZJU"
+TELEGRAM_CHAT_ID = "7407094622"
+
+# Umbrales de precio (% de movimiento en un ciclo para alertar)
+BTC_ALERT_THRESHOLD  = 3.0   # 3%
+DOGE_ALERT_THRESHOLD = 5.0   # 5%
+ETH_ALERT_THRESHOLD  = 4.0   # 4%
+
+# Keywords para filtrar noticias
+NEWS_KEYWORDS = [
+    "iran", "irán", "ceasefire", "alto el fuego",
+    "hormuz", "strait", "estrecho", "middle east",
+    "oriente medio", "israel", "hezbollah", "nuclear",
+    "trump iran", "us iran"
+]
+
+# Intervalo de chequeo en segundos
+CHECK_INTERVAL = 120  # cada 2 minutos
+
+# ─── LOGGING ────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("monitor.log")
+    ]
+)
+log = logging.getLogger(__name__)
+
+# ─── ESTADO GLOBAL ──────────────────────────────────────────
+seen_articles = set()
+last_prices = {"btc": None, "doge": None, "eth": None}
+
+
+# ─── TELEGRAM ───────────────────────────────────────────────
+def send_telegram(message: str) -> bool:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+        log.info("✅ Telegram enviado")
+        return True
+    except Exception as e:
+        log.error(f"Error Telegram: {e}")
+        return False
+
+
+# ─── PRECIOS CRYPTO ─────────────────────────────────────────
+def get_crypto_prices() -> dict:
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        params = {
+            "ids": "bitcoin,ethereum,dogecoin",
+            "vs_currencies": "usd",
+            "include_24hr_change": "true"
+        }
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        return {
+            "btc":       data["bitcoin"]["usd"],
+            "btc_24h":   data["bitcoin"]["usd_24h_change"],
+            "eth":       data["ethereum"]["usd"],
+            "eth_24h":   data["ethereum"]["usd_24h_change"],
+            "doge":      data["dogecoin"]["usd"],
+            "doge_24h":  data["dogecoin"]["usd_24h_change"],
+        }
+    except Exception as e:
+        log.error(f"Error precios: {e}")
+        return {}
+
+
+def check_price_alerts(prices: dict):
+    global last_prices
+    alerts = []
+
+    pairs = [
+        ("btc",  "BTC",  BTC_ALERT_THRESHOLD),
+        ("eth",  "ETH",  ETH_ALERT_THRESHOLD),
+        ("doge", "DOGE", DOGE_ALERT_THRESHOLD),
+    ]
+
+    for key, label, threshold in pairs:
+        current = prices.get(key)
+        previous = last_prices.get(key)
+
+        if current and previous:
+            change_pct = ((current - previous) / previous) * 100
+            if abs(change_pct) >= threshold:
+                emoji = "🟢" if change_pct > 0 else "🔴"
+                alerts.append(
+                    f"{emoji} <b>{label}</b>: ${current:,.4f} "
+                    f"({'+'if change_pct>0 else ''}{change_pct:.2f}% en 2 min)"
+                )
+
+        last_prices[key] = current
+
+    if alerts:
+        change_24h_lines = ""
+        for key, label, _ in pairs:
+            ch = prices.get(f"{key}_24h", 0)
+            e = "🟢" if ch > 0 else "🔴"
+            change_24h_lines += f"  {e} {label} 24h: {'+'if ch>0 else ''}{ch:.2f}%\n"
+
+        msg = (
+            "🚨 <b>ALERTA DE PRECIO CRYPTO</b>\n"
+            f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+            + "\n".join(alerts)
+            + "\n\n<b>Cambios 24h:</b>\n"
+            + change_24h_lines
+        )
+        send_telegram(msg)
+
+
+# ─── NOTICIAS ───────────────────────────────────────────────
+def fetch_news() -> list:
+    """Obtiene noticias desde Google News RSS (sin API key)"""
+    feeds = [
+        "https://news.google.com/rss/search?q=iran+ceasefire&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=iran+war+hormuz&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=iran+nuclear+trump&hl=en-US&gl=US&ceid=US:en",
+    ]
+    articles = []
+    for feed_url in feeds:
+        try:
+            r = requests.get(feed_url, timeout=10)
+            # Parse RSS básico sin librerías externas
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(r.content)
+            for item in root.findall(".//item"):
+                title = item.findtext("title", "")
+                link  = item.findtext("link", "")
+                pub   = item.findtext("pubDate", "")
+                articles.append({"title": title, "link": link, "pub": pub})
+        except Exception as e:
+            log.error(f"Error RSS {feed_url}: {e}")
+    return articles
+
+
+def check_news_alerts():
+    articles = fetch_news()
+    new_count = 0
+
+    for article in articles:
+        title = article["title"].lower()
+        link  = article["link"]
+
+        # Verificar si es nueva y contiene keywords
+        if link in seen_articles:
+            continue
+
+        if any(kw in title for kw in NEWS_KEYWORDS):
+            seen_articles.add(link)
+            new_count += 1
+
+            msg = (
+                "📰 <b>ALERTA GEOPOLÍTICA - IRÁN</b>\n"
+                f"🕐 {datetime.now().strftime('%H:%M:%S')}\n\n"
+                f"<b>{article['title']}</b>\n\n"
+                f"🔗 {link}"
+            )
+            send_telegram(msg)
+            time.sleep(2)  # Evitar spam si hay muchas noticias juntas
+
+    if new_count > 0:
+        log.info(f"📰 {new_count} nuevas noticias enviadas")
+
+
+# ─── LOOP PRINCIPAL ─────────────────────────────────────────
+def main():
+    log.info("🚀 Monitor iniciado")
+    send_telegram(
+        "🚀 <b>Monitor de Alertas Activo</b>\n"
+        f"🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+        "Monitoreando:\n"
+        "📰 Noticias Irán/geopolítica\n"
+        "💰 Precios BTC, ETH, DOGE\n\n"
+        f"Intervalo: cada {CHECK_INTERVAL//60} minutos"
+    )
+
+    # Inicializar precios sin alertar
+    initial = get_crypto_prices()
+    if initial:
+        for key in ["btc", "eth", "doge"]:
+            last_prices[key] = initial.get(key)
+        log.info(f"Precios iniciales — BTC: ${initial.get('btc'):,.0f} | ETH: ${initial.get('eth'):,.0f} | DOGE: ${initial.get('doge'):.5f}")
+
+    cycle = 0
+    while True:
+        cycle += 1
+        log.info(f"── Ciclo #{cycle} ──")
+
+        # Precios crypto
+        prices = get_crypto_prices()
+        if prices:
+            check_price_alerts(prices)
+
+        # Noticias (cada 2 ciclos = 4 minutos)
+        if cycle % 2 == 0:
+            check_news_alerts()
+
+        time.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
